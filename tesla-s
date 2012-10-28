@@ -1,0 +1,96 @@
+#!/bin/bash
+DIR=`dirname $0`
+OPENNLP=$DIR/opennlp-tools-1.4.3
+
+TMPDIR=`mktemp -d`
+trap "rm -rf $TMPDIR" EXIT
+
+# TMPDIR=tesla-s-temp
+# rm -rf $TMPDIR
+# mkdir -p $TMPDIR
+
+SUBMISSION=$1
+shift
+REFERENCES="$@"
+
+function take_bmng()
+{
+    FILE=$1
+    DEST=$2
+    SUFFIX=$3
+
+    cat $FILE |\
+    sed -e s/\\x92/\'/g -e 's/_/ /g' |\
+    tr '\200-\377' ' ' |\
+    $DIR/tokenizer.perl -l en > $TMPDIR/tokenized-$SUFFIX
+
+    cat $TMPDIR/tokenized-$SUFFIX |\
+    CLASSPATH=${OPENNLP}/output/opennlp-tools-1.4.3.jar:${OPENNLP}/lib/trove.jar:${OPENNLP}/lib/maxent-2.5.2.jar java opennlp.tools.lang.english.PosTagger -d $OPENNLP/models/tagdict $OPENNLP/models/tag.bin.gz |\
+    $DIR/pos_format.py opennlp > $TMPDIR/postagged-$SUFFIX
+
+    $DIR/lemmatize.sh en $TMPDIR/postagged-$SUFFIX $TMPDIR/lem-$SUFFIX
+
+    cat $TMPDIR/lem-$SUFFIX |\
+    $DIR/join_lines_by_separator.py > $TMPDIR/joined-$SUFFIX
+
+    python -c "
+def keep_tok(tok):
+    return any([c.isalnum() for c in tok])
+
+for line in open('$TMPDIR/joined-$SUFFIX'):
+    vod = line.split()
+    vod = [d for d in vod if keep_tok(d.split('_')[0])]
+    print ' '.join(vod)
+    " > $TMPDIR/alnum-$SUFFIX
+
+    cat $TMPDIR/alnum-$SUFFIX |\
+    $DIR/count_monotext_ngrams.py --ngrams su4 |\
+    $DIR/weigh_down_function.py -d0.1 > $TMPDIR/bmng-$SUFFIX
+
+    cp $TMPDIR/bmng-$SUFFIX $DEST
+}
+
+take_bmng $SUBMISSION $TMPDIR/submission sub
+
+I=0
+for REFERENCE in $REFERENCES; do
+    take_bmng $REFERENCE $TMPDIR/reference-$I ref$I
+    $DIR/pos_ngrams_mrp_wordnet.py --format=word_pos_stem --separator=_ \
+            --simmethod=exact $TMPDIR/reference-$I $TMPDIR/submission $TMPDIR/mrp-$I
+    I=$((I+1))
+done
+
+python -c "
+from glob import glob
+import sys
+
+files = [open(file) for file in glob('$TMPDIR/mrp-*')]
+
+for lines in zip(*files):
+    scores = []
+    for line in lines:
+        m1, r1, p1, m2, r2, p2, m3, r3, p3, m4, r4, p4 = map(float, line.split())
+
+        try:
+            # this is n1-f0.8
+            precision = m1 / p1
+            recall = m1 / r1
+            f1 = precision * recall / (0.8 * precision + 0.2 * recall)
+        except ZeroDivisionError:
+            f1 = 0.0
+
+        try:
+            # this is n2-f0.8
+            precision = m2 / p2
+            recall = m2 / r2
+            f2 = precision * recall / (0.8 * precision + 0.2 * recall)
+        except ZeroDivisionError:
+            f2 = 0.0
+
+        scores.append((f1 + f2) / 2)
+
+    #assert len(scores) == 8
+    # use the max score
+    #print >> sys.stderr, max(scores)
+    print max(scores)
+"
